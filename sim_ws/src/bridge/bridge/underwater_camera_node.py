@@ -28,13 +28,14 @@ render water exactly the way the running simulation does; `capture_view.py`
 uses it for its reference shots.
 """
 
+import array
 import threading
 
 import cv2
 import numpy as np
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
+from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import Image
 
 # Attenuation coefficients (1/m) and veiling light for clear chlorinated pool
@@ -70,9 +71,10 @@ class WaterColumn:
         self.noise_sigma = 2.5
         self.vignette_strength = 0.18
 
-        self._rng = np.random.default_rng()
+        self.seed(0)
         self._vignette = None
         self._vignette_shape = None
+        self._noise = None
         self.update(**overrides)
 
     def update(self, **values) -> None:
@@ -85,6 +87,10 @@ class WaterColumn:
 
     def seed(self, value: int) -> None:
         self._rng = np.random.default_rng(value or None)
+        # Sensor noise is drawn from OpenCV's generator, about four times
+        # faster than numpy's at 640x480x3. Seed it from ours so a seeded run
+        # still repeats exactly.
+        cv2.setRNGSeed(int(self._rng.integers(1 << 31)))
 
     def randomize(self, beta_range, veiling_gain_range, exposure_target_range):
         """Draw a fresh water condition from the given ranges."""
@@ -116,56 +122,76 @@ class WaterColumn:
         if self.blur_max_sigma_px <= 0.0:
             return image
         blurred = cv2.GaussianBlur(image, (0, 0), self.blur_max_sigma_px)
-        weight = np.clip(distance / max(self.blur_range_m, 1e-3), 0.0, 1.0)[:, :, None]
-        return image * (1.0 - weight) + blurred * weight
+        weight = np.clip(distance / max(self.blur_range_m, 1e-3), 0.0, 1.0)
+        # image * (1 - w) + blurred * w in one fused call; as numpy
+        # expressions this was the most expensive step of the whole model.
+        return cv2.blendLinear(image, blurred, 1.0 - weight, weight)
 
-    def _white_balance(self, image: np.ndarray) -> np.ndarray:
-        """Partial grey-world correction, standing in for the sensor's AWB.
+    def _camera_gains(self, image: np.ndarray) -> np.ndarray:
+        """Per-channel gain of the sensor's auto white balance, then auto exposure.
 
-        A real RealSense does not hand you the raw cast; it corrects some of it
-        away. Applying none of that leaves the output far bluer than any actual
-        competition frame; applying all of it removes the colour cue the
-        detector uses to tell red props from blue ones.
+        The white balance is a partial grey-world correction. A real RealSense
+        does not hand you the raw cast; it corrects some of it away. Applying
+        none of that leaves the output far bluer than any actual competition
+        frame; applying all of it removes the colour cue the detector uses to
+        tell red props from blue ones.
+
+        Both stages only look at channel means, and the mean after white
+        balance follows from the means before it, so the two collapse into one
+        multiply rather than two passes over the image.
         """
-        if self.awb_strength <= 0.0:
-            return image
-        means = image.reshape(-1, 3).mean(axis=0) + 1e-6
-        gains = 1.0 + (means.mean() / means - 1.0) * self.awb_strength
-        return image * gains
+        means = np.asarray(cv2.mean(image)[:3], np.float32)
+        gains = np.ones(3, np.float32)
+        if self.awb_strength > 0.0:
+            biased = means + 1e-6
+            gains = 1.0 + (biased.mean() / biased - 1.0) * self.awb_strength
+        if self.exposure_strength > 0.0:
+            mean = float((means * gains).mean()) + 1e-6
+            gain = 1.0 + (self.exposure_target / mean - 1.0) * self.exposure_strength
+            gains = gains * np.clip(gain, 0.4, 2.5)
+        return gains.astype(np.float32)
 
-    def _auto_exposure(self, image: np.ndarray) -> np.ndarray:
-        if self.exposure_strength <= 0.0:
-            return image
-        mean = float(image.mean()) + 1e-6
-        gain = 1.0 + (self.exposure_target / mean - 1.0) * self.exposure_strength
-        return image * np.clip(gain, 0.4, 2.5)
-
-    def _apply_vignette(self, image: np.ndarray) -> np.ndarray:
-        if self.vignette_strength <= 0.0:
-            return image
-        shape = image.shape[:2]
-        if self._vignette_shape != shape:
-            height, width = shape
+    def _vignette_for(self, shape) -> np.ndarray:
+        key = (shape, self.vignette_strength)
+        if self._vignette_shape != key:
+            height, width = shape[:2]
             ys = np.linspace(-1.0, 1.0, height, dtype=np.float32)[:, None]
             xs = np.linspace(-1.0, 1.0, width, dtype=np.float32)[None, :]
             radius = np.sqrt(xs ** 2 + ys ** 2) / np.sqrt(2.0)
-            self._vignette = (1.0 - self.vignette_strength * radius ** 2)[:, :, None]
-            self._vignette_shape = shape
-        return image * self._vignette
+            falloff = (1.0 - self.vignette_strength * radius ** 2).astype(np.float32)
+            self._vignette = cv2.merge((falloff, falloff, falloff))
+            self._vignette_shape = key
+        return self._vignette
 
     def render(self, dry: np.ndarray, distance: np.ndarray) -> np.ndarray:
-        """Apply the water column to a dry HxWx3 float image in [0, 1]."""
-        transmission = np.exp(-distance[:, :, None] * self.beta[None, None, :])
-        veiling = np.clip(self.veiling_colour * self.veiling_gain, 0.0, 1.0)
-        wet = dry * transmission + veiling[None, None, :] * (1.0 - transmission)
+        """Apply the water column to a dry HxWx3 float image in [0, 1].
+
+        Every step works in place on one copy of the frame. The arithmetic is
+        the same as the textbook form in the module docstring; it is laid out
+        this way because at 30 Hz the temporaries cost more than the maths.
+        """
+        # float32 throughout: the OpenCV calls below accept nothing wider.
+        distance = np.asarray(distance, np.float32)
+        transmission = cv2.exp(distance[:, :, None] * -self.beta)
+        veiling = np.clip(self.veiling_colour * self.veiling_gain, 0.0, 1.0).astype(np.float32)
+        # J * t + B * (1 - t)  ==  (J - B) * t + B
+        wet = np.subtract(dry, veiling, dtype=np.float32)
+        wet *= transmission
+        wet += veiling
 
         wet = self._scatter_blur(wet, distance)
-        wet = self._white_balance(wet)
-        wet = self._auto_exposure(wet)
-        wet = self._apply_vignette(wet)
+        wet *= self._camera_gains(wet)
+        if self.vignette_strength > 0.0:
+            wet *= self._vignette_for(wet.shape)
         if self.noise_sigma > 0.0:
-            wet = wet + self._rng.normal(0.0, self.noise_sigma / 255.0, wet.shape)
-        return np.clip(wet, 0.0, 1.0)
+            if self._noise is None or self._noise.shape != wet.shape:
+                self._noise = np.empty(wet.shape, np.float32)
+            # Per-channel tuples: a bare float becomes Scalar(s, 0, 0, 0) and
+            # only the first channel would get any noise.
+            sigma = self.noise_sigma / 255.0
+            cv2.randn(self._noise, (0.0, 0.0, 0.0), (sigma, sigma, sigma))
+            wet += self._noise
+        return np.clip(wet, 0.0, 1.0, out=wet)
 
 
 def decode_depth(msg: Image) -> np.ndarray:
@@ -240,12 +266,20 @@ class UnderwaterCamera(Node):
             QoSProfile(depth=1,
                        reliability=ReliabilityPolicy.RELIABLE,
                        history=HistoryPolicy.KEEP_LAST))
+        # Inputs are best effort like sensor data, but depth 1 rather than its
+        # 5. With 5, any frame that takes longer than the render period leaves
+        # a backlog, and from then on every published frame is several frames
+        # stale — measured at ~450 ms behind the dry render. Depth 1 drops the
+        # backlog instead, so what goes out is always the newest frame.
+        latest_only = QoSProfile(depth=1,
+                                 reliability=ReliabilityPolicy.BEST_EFFORT,
+                                 history=HistoryPolicy.KEEP_LAST)
         self.create_subscription(
             Image, self.get_parameter('input_depth_topic').value,
-            self._on_depth, qos_profile_sensor_data)
+            self._on_depth, latest_only)
         self.create_subscription(
             Image, self.get_parameter('input_image_topic').value,
-            self._on_image, qos_profile_sensor_data)
+            self._on_image, latest_only)
 
         self.get_logger().info(
             f'Underwater camera: {self.get_parameter("input_image_topic").value} '
@@ -296,7 +330,11 @@ class UnderwaterCamera(Node):
         out.encoding = msg.encoding
         out.is_bigendian = msg.is_bigendian
         out.step = msg.width * 3
-        out.data = (wet * 255.0).astype(np.uint8).tobytes()
+        wet *= 255.0
+        # Hand rclpy an array.array, not bytes. For anything else the generated
+        # setter checks every element in Python before copying — 43 ms per
+        # 640x480 frame, more than the whole water model.
+        out.data = array.array('B', wet.astype(np.uint8).tobytes())
         self.publisher.publish(out)
 
 
